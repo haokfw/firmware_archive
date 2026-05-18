@@ -1,0 +1,124 @@
+name: Check firmware release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 22 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests urllib3 fake-useragent tqdm
+
+      - name: Check new firmware
+        id: sync
+        env:
+          IKUAI_PROXY: ""
+        run: |
+          python scripts/ikuai_firmware_download.py check-release --release-dir .release
+
+      - name: Download dev firmware
+        id: dev
+        run: |
+          mkdir -p .release
+          set +e
+          python scripts/dev_download.py all 2>&1 | tee .release/dev-download.log
+          status=${PIPESTATUS[0]}
+          grep '^downloaded: ' .release/dev-download.log | sed 's/^downloaded: //' > .release/dev-assets.txt || true
+          if [ -s .release/dev-assets.txt ]; then
+            echo 'has_updates=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has_updates=false' >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo 'assets<<__ASSETS__'
+            cat .release/dev-assets.txt
+            echo '__ASSETS__'
+          } >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::dev_download.py exited with status $status; continuing with downloaded assets"
+          fi
+
+      - name: Prepare release metadata
+        id: release
+        env:
+          SYNC_HAS_UPDATES: ${{ steps.sync.outputs.has_updates }}
+          SYNC_RELEASE_NOTES: ${{ steps.sync.outputs.release_notes }}
+          SYNC_TAG_NAME: ${{ steps.sync.outputs.tag_name }}
+          SYNC_RELEASE_NAME: ${{ steps.sync.outputs.release_name }}
+          DEV_HAS_UPDATES: ${{ steps.dev.outputs.has_updates }}
+        run: |
+          mkdir -p .release
+          if [ "$SYNC_HAS_UPDATES" != "true" ] && [ "$DEV_HAS_UPDATES" != "true" ]; then
+            echo 'has_updates=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$SYNC_HAS_UPDATES" = "true" ]; then
+            release_notes="$SYNC_RELEASE_NOTES"
+            tag_name="$SYNC_TAG_NAME"
+            release_name="$SYNC_RELEASE_NAME"
+            if [ -s .release/dev-assets.txt ]; then
+              {
+                echo
+                echo "开发服务器固件:"
+                sed 's/^/- /' .release/dev-assets.txt
+              } >> "$release_notes"
+            fi
+          else
+            timestamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+            release_notes=".release/release-notes.md"
+            tag_name="ikuai-dev-firmware-$timestamp"
+            release_name="iKuai dev firmware $timestamp"
+            {
+              echo "发布日期: $timestamp"
+              echo
+              echo "开发服务器固件:"
+              sed 's/^/- /' .release/dev-assets.txt
+            } > "$release_notes"
+          fi
+
+          {
+            echo 'has_updates=true'
+            echo "release_notes=$release_notes"
+            echo "tag_name=$tag_name"
+            echo "release_name=$release_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: steps.release.outputs.has_updates == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag_name }}
+          name: ${{ steps.release.outputs.release_name }}
+          body_path: ${{ steps.release.outputs.release_notes }}
+          files: |
+            ${{ steps.sync.outputs.assets }}
+            ${{ steps.dev.outputs.assets }}
+
+      - name: Commit metadata
+        if: steps.release.outputs.has_updates == 'true'
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add version_list.txt version_enterprise_list.txt version_oem_list.txt state/latest_versions.json state/device_map.json state/update_contents.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "chore: update firmware metadata for ${{ steps.release.outputs.tag_name }}"
+          git push
