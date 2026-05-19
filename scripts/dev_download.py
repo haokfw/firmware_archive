@@ -10,6 +10,7 @@ import random
 import secrets
 import shutil
 import ssl
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -651,6 +652,25 @@ def version_all_relative_path(entry: VersionAllFirmware) -> Path:
     return Path("firmware") / version_all_device_name(entry) / version_all_edition(entry) / entry.filename
 
 
+def git_tracked_paths(prefix: str) -> set[str]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD", "--", prefix],
+            cwd=ROOT_DIR,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+
+    return {
+        line.strip().replace("\\", "/")
+        for line in result.stdout.splitlines()
+        if line.strip()
+    }
+
+
 def entry_matches_device_filter(entry: VersionAllFirmware, normalized_filter: str | None) -> bool:
     if not normalized_filter:
         return True
@@ -1116,6 +1136,7 @@ def run_public_version_all(args: argparse.Namespace, output_root: Path) -> int:
     entries = dedupe_version_all_entries([*entries, *collect_dev_type_firmware(args, entries)])
 
     mtls_session: requests.Session | None = None
+    tracked_firmware = git_tracked_paths("firmware")
     skipped = 0
     downloaded = 0
     failures: list[str] = []
@@ -1124,7 +1145,7 @@ def run_public_version_all(args: argparse.Namespace, output_root: Path) -> int:
         relative_path = version_all_relative_path(entry)
         output_file = output_root / relative_path
 
-        if output_file.exists() and not args.force:
+        if (output_file.exists() or relative_path.as_posix() in tracked_firmware) and not args.force:
             skipped += 1
             print(f"skipped: {relative_path.as_posix()}")
             continue

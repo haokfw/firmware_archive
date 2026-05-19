@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -579,6 +580,25 @@ def output_path_text(path: Path) -> str:
         return path.as_posix()
 
 
+def git_tracked_paths(prefix: str) -> set[str]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD", "--", prefix],
+            cwd=ROOT_DIR,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+
+    return {
+        line.strip().replace("\\", "/")
+        for line in result.stdout.splitlines()
+        if line.strip()
+    }
+
+
 def response_total_bytes(response, initial_bytes: int) -> int | None:
     content_range = response.headers.get("Content-Range")
     if content_range and "/" in content_range:
@@ -797,23 +817,15 @@ def release_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def write_release_files(
-    release_dir: Path,
-    latest: dict[str, dict[str, object]],
-    changed_editions: list[str],
-    asset_paths: list[str],
-) -> tuple[str, str, str]:
+def write_release_files(release_dir: Path, asset_paths: list[str]) -> tuple[str, str, str]:
     release_dir.mkdir(parents=True, exist_ok=True)
     timestamp = release_timestamp()
 
     notes_lines = [
         f"发布日期: {timestamp}",
         "",
-        "更新版本:",
+        "新增固件:",
     ]
-    for edition in changed_editions:
-        notes_lines.append(f"- {edition}: {latest[edition]['version']}")
-    notes_lines.extend(["", "附件列表:"])
     for asset_path in asset_paths:
         notes_lines.append(f"- {asset_path}")
 
@@ -881,25 +893,23 @@ def command_download(args: argparse.Namespace) -> int:
 def command_check_release(args: argparse.Namespace) -> int:
     raw_version_all = fetch_text_with_proxy(VERSION_SOURCE_URL, args.proxy)
     sections = parse_sections(raw_version_all)
-    save_update_contents(UPDATE_CONTENT_FILE, collect_update_contents(sections))
     latest = build_latest_metadata(sections)
-    ensure_layout(args.output_dir)
-    state = load_state(args.state_file)
-
-    changed_editions = [
-        edition
-        for edition in EDITIONS
-        if state.get(edition, {}).get("version") != latest[edition]["version"]
+    tracked_firmware = git_tracked_paths("firmware")
+    all_assets = collect_version_all_assets(sections, "all")
+    assets = [
+        asset
+        for asset in all_assets
+        if args.force or asset.relative_path.as_posix() not in tracked_firmware
     ]
 
-    update_history_files(latest)
-
-    if not changed_editions:
+    if not assets:
         write_github_outputs(False)
         print("no new firmware")
         return 0
 
-    assets = build_changed_assets(latest, changed_editions)
+    save_update_contents(UPDATE_CONTENT_FILE, collect_update_contents(sections))
+    update_history_files(latest)
+
     saved, failures = download_assets(
         assets,
         args.output_dir,
@@ -914,12 +924,7 @@ def command_check_release(args: argparse.Namespace) -> int:
     if not args.dry_run:
         save_state(args.state_file, latest)
 
-    release_notes, tag_name, release_name = write_release_files(
-        args.release_dir,
-        latest,
-        changed_editions,
-        saved,
-    )
+    release_notes, tag_name, release_name = write_release_files(args.release_dir, saved)
     write_github_outputs(
         True,
         release_notes=release_notes,

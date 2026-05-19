@@ -119,14 +119,53 @@ jobs:
             ${{ steps.sync.outputs.assets }}
             ${{ steps.dev.outputs.assets }}
 
-      - name: Commit metadata
+      - name: Commit firmware and metadata
         if: steps.release.outputs.has_updates == 'true'
         run: |
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add version_list.txt version_enterprise_list.txt version_oem_list.txt state/latest_versions.json state/device_map.json state/update_contents.json
+          git add --sparse firmware version_list.txt version_enterprise_list.txt version_oem_list.txt state/latest_versions.json state/device_map.json state/update_contents.json
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m "chore: update firmware metadata for ${{ steps.release.outputs.tag_name }}"
-          git push
+
+          git diff --cached --name-only -z > .release/staged-files.z
+          python - <<'PY'
+          from pathlib import Path
+
+          limit = 700 * 1024 * 1024
+          data = Path(".release/staged-files.z").read_bytes()
+          files = [item.decode() for item in data.split(b"\0") if item]
+          batches = []
+          current = []
+          current_size = 0
+
+          for path in files:
+              size = Path(path).stat().st_size if Path(path).exists() else 0
+              if current and current_size + size > limit:
+                  batches.append(current)
+                  current = []
+                  current_size = 0
+              current.append(path)
+              current_size += size
+
+          if current:
+              batches.append(current)
+
+          for index, batch in enumerate(batches, start=1):
+              Path(f".release/commit-batch-{index:02d}.txt").write_text(
+                  "\n".join(batch) + "\n",
+                  encoding="utf-8",
+              )
+          Path(".release/commit-batch-count.txt").write_text(str(len(batches)), encoding="utf-8")
+          PY
+
+          count="$(cat .release/commit-batch-count.txt)"
+          branch="${GITHUB_REF_NAME:-main}"
+          git reset --quiet HEAD
+          for batch in $(seq 1 "$count"); do
+            file=".release/commit-batch-$(printf '%02d' "$batch").txt"
+            git add --sparse --pathspec-from-file="$file"
+            git commit -m "chore: update firmware assets for ${{ steps.release.outputs.tag_name }} batch $(printf '%02d' "$batch")"
+            git push origin "HEAD:$branch"
+          done
