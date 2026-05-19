@@ -901,6 +901,13 @@ def command_check_release(args: argparse.Namespace) -> int:
         for asset in all_assets
         if args.force or asset.relative_path.as_posix() not in tracked_firmware
     ]
+    checked_devices = sorted({asset.device_name for asset in all_assets if asset.device_name})
+    print(
+        f"checked devices={len(checked_devices)} "
+        f"firmware_candidates={len(all_assets)} new_firmware={len(assets)}"
+    )
+    if checked_devices:
+        print("checked device list: " + ", ".join(checked_devices))
 
     if not assets:
         write_github_outputs(False)
